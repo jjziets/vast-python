@@ -4946,61 +4946,48 @@ def debug_print(args, *args_to_print):
         print(*args_to_print)
 
 def instance_exist(instance_id, api_key, args):
-    """
-    Checks whether a specific instance exists and is active.
-
-    This function verifies the existence and status of an instance by querying
-    its details using the provided `instance_id`. It considers an instance as
-    non-existent if its status indicates it has been destroyed, terminated, or
-    is offline.
-
-    Args:
-        instance_id (str): The ID of the instance to check.
-        api_key (str): API key for authentication with the VAST API.
-        args (argparse.Namespace): Parsed command-line arguments containing flags
-                                  and options such as `url` and `retry`.
-
-    Returns:
-        bool: 
-            - `True` if the instance exists and is active.
-            - `False` if the instance does not exist or is in a non-active state.
-    """
-    # Ensure debugging is set in args
     if not hasattr(args, 'debugging'):
         args.debugging = False
 
-
     if not instance_id:
-        return False  # Immediately return False if instance_id is None or empty
+        return False
 
     show_args = argparse.Namespace(
-        id=instance_id, api_key=api_key, url=args.url, retry=args.retry, explain=False, raw=True, debugging=args.debugging
+        id=instance_id,
+        api_key=api_key,
+        url=args.url,
+        retry=args.retry,
+        explain=False,
+        raw=True,
+        debugging=args.debugging
     )
     try:
-        # Call show__instance and assume it returns a dictionary
         instance_info = show__instance(show_args)
-
-        # Ensure the response is a dictionary
-        if not instance_info or not isinstance(instance_info, dict):
+        
+        # Empty list or None means instance doesn't exist - return False without error
+        if not instance_info:
             return False
 
-        # Check if `intended_status` or `actual_status` indicates the instance is destroyed
+        # If we have instance info, check its status
         status = instance_info.get('intended_status') or instance_info.get('actual_status')
         if status in ['destroyed', 'terminated', 'offline']:
             return False
 
-        # If we get here, the instance exists and is active
         return True
 
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        if args.debugging:
-            debug_print(args, f"Error decoding instance info: {e}")
-        return False
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
+            # Instance does not exist
             return False
-        raise  # Reraise other HTTP errors for handling elsewhere
-
+        else:
+            if args.debugging:
+                debug_print(args, f"HTTPError when checking instance existence: {e}")
+            return False
+    except Exception as e:
+        if args.debugging:
+            debug_print(args, f"No instance found or Unexpected error checking instance existence: {e}")
+        return False
+    
 def run_machinetester(ip_address, port, instance_id, machine_id, delay, args, api_key=None):
     """
     Executes machine testing by connecting to the specified IP and port, monitoring
@@ -5041,17 +5028,28 @@ def run_machinetester(ip_address, port, instance_id, machine_id, delay, args, ap
 
     def is_instance(instance_id):
         """Check instance status via show__instance."""
-        show_args = argparse.Namespace(id=instance_id, explain=False, api_key=api_key, url="https://console.vast.ai", retry=3, raw=True,debbuging=args.debugging,)
+        show_args = argparse.Namespace(
+            id=instance_id,
+            explain=False,
+            api_key=api_key,
+            url="https://console.vast.ai",
+            retry=3,
+            raw=True,
+            debugging=args.debugging,
+        )
         try:
-            buffer = show__instance(show_args)
-            json_output = buffer.getvalue().strip()
+            instance_info = show__instance(show_args)
             if args.debugging:
-                debug_print(args, f"is_instance(): Output from vast show instance: {json_output}")
+                debug_print(args, f"is_instance(): Output from vast show instance: {instance_info}")
 
-            data = json.loads(json_output)
-            actual_status = data.get('actual_status', 'unknown')
+            if not instance_info or not isinstance(instance_info, dict):
+                if args.debugging:
+                    debug_print(args, "is_instance(): No valid instance information received.")
+                return 'unknown'
+
+            actual_status = instance_info.get('actual_status', 'unknown')
             return actual_status if actual_status in ['running', 'offline', 'exited', 'created'] else 'unknown'
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             if args.debugging:
                 debug_print(args, f"is_instance(): Error: {e}")
             return 'unknown'
@@ -5471,17 +5469,17 @@ def self_test__machine(args):
 
                 # Prepare arguments for instance creation
                 create_args = argparse.Namespace(
-                    ID=ask_contract_id,
-                    price=None,
-                    disk=20,
-                    image="vastai/test:selftest",
+                    id=ask_contract_id,
+                    price=None,  # Set bid_price to None
+                    disk=40,  # Match the disk size from the working command
+                    image="vastai/test:selftest",  # Use the same image as the working command
                     login=None,
                     label=None,
                     onstart=None,
                     onstart_cmd="python3 remote.py",
                     entrypoint=None,
-                    ssh=True,
-                    jupyter=False,
+                    ssh=False,  # Set ssh to False
+                    jupyter=True,  # Set jupyter to True
                     direct=True,
                     jupyter_dir=None,
                     jupyter_lab=False,
@@ -5499,6 +5497,7 @@ def self_test__machine(args):
                     url=args.url,
                     retry=args.retry,
                     debugging=args.debugging,
+                    bid_price=None,  # Ensure bid_price is None
                 )
 
                 # Create instance
@@ -5559,8 +5558,12 @@ def self_test__machine(args):
         result["reason"] = str(e)
 
     finally:
-        if instance_id and instance_exist(instance_id, api_key, destroy_args):
-            destroy_instance_silent(instance_id, destroy_args)
+        try:
+            if instance_id and instance_exist(instance_id, api_key, destroy_args):
+                destroy_instance_silent(instance_id, destroy_args)
+        except Exception as e:
+            if args.debugging:
+                debug_print(args, f"Error during cleanup: {e}")
 
     # Output results
     if args.raw:

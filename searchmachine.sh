@@ -7,4 +7,4 @@ if [ "$#" -ne 1 ]; then
 fi
 
 # Run the vast search command with the provided machine ID
-./vast search offers "machine_id=$1 verified=any rentable=any"
+./vast.py search offers "machine_id=$1 verified=any rentable=any"
