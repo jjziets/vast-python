@@ -1,0 +1,165 @@
+name: Live Self-Test Dogfood
+
+on:
+  workflow_dispatch:
+    inputs:
+      machine_id:
+        description: "Optional machine ID. Leave blank to search for a cheap eligible machine."
+        required: false
+        default: ""
+      max_dph_total:
+        description: "Maximum total hourly price for searched offers."
+        required: false
+        default: "0.10"
+  push:
+    branches:
+      - dogfood/live-self-test-3os
+
+jobs:
+  live-self-test:
+    name: live-self-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+      REQUESTED_MACHINE_ID: ${{ github.event.inputs.machine_id || '' }}
+      MAX_DPH_TOTAL: ${{ github.event.inputs.max_dph_total || '0.10' }}
+      SUPPORT_DIR: dogfood-bundles
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CLI from this branch
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          vastai --help >/dev/null
+
+      - name: Verify API key is present
+        shell: bash
+        run: |
+          if [ -z "${VAST_API_KEY:-}" ]; then
+            echo "VAST_API_KEY secret is not configured"
+            exit 1
+          fi
+
+      - name: Select dogfood machine
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$SUPPORT_DIR"
+          if [ -n "${REQUESTED_MACHINE_ID:-}" ]; then
+            echo "Using requested machine ${REQUESTED_MACHINE_ID}"
+            echo "MACHINE_ID=${REQUESTED_MACHINE_ID}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          query="verified=true rentable=true rented=false reliability>0.985 inet_down>400 inet_up>400 num_gpus=1 dph_total<${MAX_DPH_TOTAL} direct_port_count>=3"
+          echo "Search query: ${query}" | tee dogfood-search.log
+          vastai search offers "$query" --raw > dogfood-offers.json
+          python - <<'PY' | tee dogfood-selected.txt
+          import json
+          import os
+          from pathlib import Path
+
+          data = json.loads(Path("dogfood-offers.json").read_text())
+          rows = data if isinstance(data, list) else data.get("offers", data.get("results", []))
+          rows = [row for row in rows if row.get("machine_id")]
+          if not rows:
+              raise SystemExit("No eligible dogfood offers found")
+          rows.sort(key=lambda row: float(row.get("dph_total") or 999))
+          selected = rows[0]
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"MACHINE_ID={selected['machine_id']}\n")
+          print("Selected machine:", selected.get("machine_id"))
+          print("Offer ID:", selected.get("id"))
+          print("GPU:", selected.get("gpu_name"))
+          print("dph_total:", selected.get("dph_total"))
+          print("reliability:", selected.get("reliability"))
+          print("inet_down/up:", selected.get("inet_down"), selected.get("inet_up"))
+          print("direct_port_count:", selected.get("direct_port_count"))
+          print("cuda_max_good:", selected.get("cuda_max_good"))
+          PY
+
+      - name: Run paid live self-test
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "Running live self-test for machine ${MACHINE_ID}"
+          vastai self-test machine "$MACHINE_ID" --support-bundle-dir "$SUPPORT_DIR" 2>&1 | tee self-test.log
+
+      - name: Smoke dump-logs
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          vastai dump-logs "${MACHINE_ID:-unknown}" --output-dir "$SUPPORT_DIR" --raw > dump-logs.json
+          status=$?
+          echo "dump-logs exit status: $status"
+          cat dump-logs.json
+          exit 0
+
+      - name: Audit and clean self-test instances
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          vastai show instances --raw > active-instances-before-cleanup.json
+          python - <<'PY' > self-test-instance-ids.txt
+          import json
+          from pathlib import Path
+
+          text = Path("active-instances-before-cleanup.json").read_text()
+          data = json.loads(text)
+          rows = data if isinstance(data, list) else data.get("instances", [])
+          for row in rows or []:
+              label = str(row.get("label") or "")
+              if label.startswith("vast-self-test-machine-"):
+                  print(row.get("id"))
+          PY
+          if [ -s self-test-instance-ids.txt ]; then
+            while read -r instance_id; do
+              echo "Destroying lingering self-test instance ${instance_id}"
+              vastai destroy instance "$instance_id" -y || true
+            done < self-test-instance-ids.txt
+          fi
+          vastai show instances --raw > active-instances-after-cleanup.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("active-instances-after-cleanup.json").read_text())
+          rows = data if isinstance(data, list) else data.get("instances", [])
+          lingering = [
+              row for row in (rows or [])
+              if str(row.get("label") or "").startswith("vast-self-test-machine-")
+          ]
+          print(f"remaining_self_test_instances={len(lingering)}")
+          if lingering:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload dogfood artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-self-test-${{ matrix.os }}
+          path: |
+            dogfood-*.json
+            dogfood-*.log
+            dogfood-selected.txt
+            self-test.log
+            dump-logs.json
+            active-instances-*.json
+            self-test-instance-ids.txt
+            dogfood-bundles/**
+          if-no-files-found: ignore
