@@ -11,9 +11,6 @@ on:
         description: "Maximum total hourly price for searched offers."
         required: false
         default: "0.10"
-  push:
-    branches:
-      - dogfood/live-self-test-3os
 
 jobs:
   live-self-test:
@@ -63,7 +60,7 @@ jobs:
             exit 0
           fi
 
-          query="verified=true rentable=true rented=false reliability>0.985 inet_down>400 inet_up>400 num_gpus=1 dph_total<${MAX_DPH_TOTAL} direct_port_count>=3"
+          query="verified=true rentable=true rented=false reliability>0.985 inet_down>400 inet_up>400 num_gpus=1 dph_total<${MAX_DPH_TOTAL} direct_port_count>=3 cpu_ram>=12000"
           echo "Search query: ${query}" | tee dogfood-search.log
           vastai search offers "$query" --raw > dogfood-offers.json
           python - <<'PY' | tee dogfood-selected.txt
