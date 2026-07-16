@@ -209,3 +209,70 @@ class TestSelfTestMachineIgnoreRequirements:
         assert "warning" in raw
         assert "Requirement checks are skipped as a pass/fail gate" in raw["warning"]
         assert "does not qualify this machine for verification" in raw["warning"]
+
+
+class TestSelfTestMachinePortRange:
+    def test_passes_host_port_range_to_self_test_container(
+        self, parse_argv, monkeypatch, capsys
+    ):
+        from vastai.cli.commands import machines
+        from vastai.cli.self_test.port_range import PortRange
+
+        offer = {
+            "id": 202,
+            "dlperf": 1.0,
+            "cuda_max_good": 13.0,
+            "compute_cap": 1200,
+            "reliability": 0.99,
+            "direct_port_count": 10,
+            "pcie_bw": 4.0,
+            "gpu_total_ram": 32 * 1024,
+            "inet_down": 200.0,
+            "inet_up": 200.0,
+            "gpu_ram": 32,
+            "cpu_ram": 64 * 1024,
+            "cpu_cores": 8,
+            "num_gpus": 1,
+        }
+        instance = {
+            "intended_status": "running",
+            "actual_status": "running",
+            "public_ipaddr": "203.0.113.10",
+            "ports": {"5000/tcp": [{"HostPort": "5000"}]},
+        }
+
+        monkeypatch.setattr(
+            machines,
+            "resolve_port_range",
+            Mock(return_value=(PortRange(40000, 40002), "host_port_range")),
+        )
+        monkeypatch.setattr(machines.offers_api, "search_offers", Mock(return_value=[offer]))
+        create_instance = Mock(return_value={"new_contract": 303})
+        monkeypatch.setattr(machines.instances_api, "create_instance", create_instance)
+        monkeypatch.setattr(machines.instances_api, "show_instance", Mock(return_value=instance))
+        monkeypatch.setattr(
+            machines,
+            "scan_mapped_port_range",
+            Mock(return_value={
+                "status": "passed",
+                "range": "40000-40002",
+                "mapped_entries": 6,
+                "missing_mappings": [],
+                "failed": [],
+            }),
+        )
+        monkeypatch.setattr(machines.instances_api, "destroy_instance", Mock(return_value={"success": True}))
+        monkeypatch.setattr(machines.requests, "get", lambda *_, **__: SimpleNamespace(status_code=200, text="DONE"))
+        monkeypatch.setattr(machines.time, "sleep", lambda *_: None)
+
+        args = parse_argv(["self-test", "machine", "123"])
+        with pytest.raises(SystemExit) as exc_info:
+            args.func(args)
+
+        assert exc_info.value.code == 0
+        env = create_instance.call_args.kwargs["env"]
+        assert env["-p 40000-40002:40000-40002/tcp"] == "1"
+        assert env["-p 40000-40002:40000-40002/udp"] == "1"
+        assert env["VAST_SELF_TEST_PORT_START"] == "40000"
+        assert env["VAST_SELF_TEST_PORT_END"] == "40002"
+        assert "Port-range scan passed" in capsys.readouterr().out

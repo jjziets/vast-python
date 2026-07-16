@@ -24,6 +24,12 @@ from vastai.api import storage as storage_api
 
 from vastai.cli.utils import get_parser as _get_parser, get_client  # noqa: F401
 from vastai.cli.util import required_inet_mbps
+from vastai.cli.self_test.port_range import (
+    MAX_MAPPED_PORTS,
+    port_range_docker_args,
+    resolve_port_range,
+    scan_mapped_port_range,
+)
 
 
 parser = _get_parser()
@@ -533,7 +539,8 @@ def add__network_disk(args):
     argument("machine_id", help="Machine ID", type=str),
     argument("--debugging", action="store_true", help="Enable debugging output"),
     argument("--ignore-requirements", action="store_true", help="Ignore the minimum system requirements and run the self test regardless"),
-    usage="vastai self-test machine <machine_id> [--debugging] [--ignore-requirements]",
+    argument("--port-scan-timeout", type=float, default=3.0, help="Timeout in seconds for each direct-port TCP/UDP probe"),
+    usage="vastai self-test machine <machine_id> [--debugging] [--ignore-requirements] [--port-scan-timeout SECONDS]",
     help="[Host] Perform a self-test on the specified machine",
     epilog=deindent("""
         This command tests if a machine meets specific requirements and
@@ -558,6 +565,8 @@ def self_test__machine(args):
 
     if not hasattr(args, 'debugging'):
         args.debugging = False
+    if not hasattr(args, 'port_scan_timeout'):
+        args.port_scan_timeout = 3.0
 
     if args.ignore_requirements:
         result["warning"] = ignore_requirements_warning
@@ -579,6 +588,43 @@ def self_test__machine(args):
             return 0
 
     client = get_client(args)
+
+    configured_port_range, port_range_source = resolve_port_range()
+    if configured_port_range is not None:
+        # The self-test instance also exposes the progress TCP port, the UDP
+        # responder, and usually SSH.  Vast currently limits an instance to
+        # 64 mapped port/protocol entries, so a complete TCP+UDP range can be
+        # handed to one instance only when it fits alongside those ports.
+        fixed_mapping_count = 4
+        range_mapping_count = configured_port_range.count * 2
+        if fixed_mapping_count + range_mapping_count <= MAX_MAPPED_PORTS:
+            result["port_scan"] = {
+                "status": "pending",
+                "range": configured_port_range.value,
+                "source": port_range_source,
+                "expected_ports": configured_port_range.count,
+            }
+        else:
+            result["port_scan"] = {
+                "status": "unsupported",
+                "range": configured_port_range.value,
+                "source": port_range_source,
+                "expected_ports": configured_port_range.count,
+                "reason": (
+                    f"Range contains {configured_port_range.count} ports, but a complete "
+                    "TCP+UDP scan needs two mappings per port and the platform limits "
+                    f"one instance to {MAX_MAPPED_PORTS} mapped entries."
+                ),
+            }
+            progress_print(
+                f"Port-range scan skipped for {configured_port_range.value}: "
+                f"the range is larger than the {MAX_MAPPED_PORTS}-mapping per-instance limit."
+            )
+    else:
+        result["port_scan"] = {
+            "status": "skipped",
+            "reason": "No readable host port range was found before instance creation.",
+        }
 
     try:
         # ----- check requirements -----
@@ -670,6 +716,10 @@ def self_test__machine(args):
             progress_print("Continuing despite unmet requirements because --ignore-requirements is set.")
         if args.ignore_requirements:
             progress_print(ignore_requirements_warning)
+        if result.get("port_scan", {}).get("status") == "unsupported":
+            result["reason"] = result["port_scan"]["reason"]
+            progress_print(f"Port-range self-test cannot continue: {result['reason']}")
+            return result
 
         # ----- CUDA version to docker image mapping -----
         def cuda_map_to_image(cuda_version, compute_cap=None):
@@ -766,7 +816,19 @@ def self_test__machine(args):
             # ----- create the test instance -----
             try:
                 from vastai.cli.util import parse_env
-                env = parse_env("-e TZ=PDT -e XNAME=XX4 -p 5000:5000 -p 1234:1234")
+                port_args = "-p 5000:5000 -p 1234:1234 -p 5001:5001/udp"
+                if (
+                    configured_port_range is not None
+                    and result.get("port_scan", {}).get("status") == "pending"
+                ):
+                    port_args += " " + port_range_docker_args(configured_port_range)
+                env_args = f"-e TZ=PDT -e XNAME=XX4 {port_args}"
+                if configured_port_range is not None and result.get("port_scan", {}).get("status") == "pending":
+                    env_args += (
+                        f" -e VAST_SELF_TEST_PORT_START={configured_port_range.start}"
+                        f" -e VAST_SELF_TEST_PORT_END={configured_port_range.end}"
+                    )
+                env = parse_env(env_args)
 
                 progress_print(f"Starting test with {docker_image} ({image_reason})")
                 rj = instances_api.create_instance(
@@ -1014,6 +1076,62 @@ def self_test__machine(args):
                     if not ip_address:
                         result["reason"] = "Failed to retrieve public IP address."
                     else:
+                        if result.get("port_scan", {}).get("status") == "skipped":
+                            api_port_range, api_range_source = resolve_port_range(instance_info, host_path="/nonexistent")
+                            if api_port_range is not None:
+                                result["port_scan"].update({
+                                    "range": api_port_range.value,
+                                    "source": api_range_source,
+                                    "note": "The API range was available only after launch; no range mappings were requested.",
+                                })
+
+                        if result.get("port_scan", {}).get("status") == "pending":
+                            try:
+                                scan = scan_mapped_port_range(
+                                    instance_info,
+                                    ip_address,
+                                    configured_port_range,
+                                    timeout=args.port_scan_timeout,
+                                )
+                                result["port_scan"] = {
+                                    **result["port_scan"],
+                                    **scan,
+                                }
+                                progress_print(
+                                    f"Port-range scan {scan['status']}: "
+                                    f"{scan['mapped_entries']} mapped entries for {scan['range']}."
+                                )
+                                for missing in scan["missing_mappings"]:
+                                    progress_print(
+                                        f"  MISSING {missing['protocol'].upper()} "
+                                        f"{missing['container_port']}/"
+                                        f"{missing['protocol']} mapping"
+                                    )
+                                for failed in scan["failed"]:
+                                    progress_print(
+                                        f"  FAILED {failed['protocol'].upper()} "
+                                        f"{failed['public_ip']}:{failed['host_port']} "
+                                        f"(container {failed['container_port']}/{failed['protocol']}): "
+                                        f"{failed.get('error', 'unreachable')}"
+                                    )
+                                if scan["status"] != "passed":
+                                    result["reason"] = (
+                                        f"Port-range connectivity check failed for {scan['range']}."
+                                    )
+                                    if instance_exist(instance_id):
+                                        destroy_instance_silent(instance_id)
+                                    return result
+                            except Exception as error:
+                                result["port_scan"] = {
+                                    **result["port_scan"],
+                                    "status": "error",
+                                    "reason": str(error),
+                                }
+                                result["reason"] = f"Port-range connectivity check errored: {error}"
+                                if instance_exist(instance_id):
+                                    destroy_instance_silent(instance_id)
+                                return result
+
                         all_ports = instance_info.get("ports", {})
                         port_mappings = all_ports.get("5000/tcp", [])
                         port = port_mappings[0].get("HostPort") if port_mappings else None

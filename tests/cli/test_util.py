@@ -22,6 +22,12 @@ class TestParseEnv:
         result = parse_env("-p 8080:8080/tcp")
         assert "-p 8080:8080/tcp" in result
 
+    def test_port_range_mapping(self):
+        from vastai.cli.util import parse_env
+        result = parse_env("-p 40000-40002:40000-40002/tcp -p 40000-40002:40000-40002/udp")
+        assert "-p 40000-40002:40000-40002/tcp" in result
+        assert "-p 40000-40002:40000-40002/udp" in result
+
     def test_volume_mapping(self):
         from vastai.cli.util import parse_env
         result = parse_env("-v /host:/container")
