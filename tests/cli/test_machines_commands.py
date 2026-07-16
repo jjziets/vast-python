@@ -224,7 +224,7 @@ class TestSelfTestMachinePortRange:
             "cuda_max_good": 13.0,
             "compute_cap": 1200,
             "reliability": 0.99,
-            "direct_port_count": 10,
+            "direct_port_count": 125,
             "pcie_bw": 4.0,
             "gpu_total_ram": 32 * 1024,
             "inet_down": 200.0,
@@ -244,7 +244,7 @@ class TestSelfTestMachinePortRange:
         monkeypatch.setattr(
             machines,
             "resolve_port_range",
-            Mock(return_value=(PortRange(40000, 40002), "host_port_range")),
+            Mock(return_value=(PortRange(40000, 40099), "host_port_range")),
         )
         monkeypatch.setattr(machines.offers_api, "search_offers", Mock(return_value=[offer]))
         create_instance = Mock(return_value={"new_contract": 303})
@@ -255,8 +255,8 @@ class TestSelfTestMachinePortRange:
             "scan_mapped_port_range",
             Mock(return_value={
                 "status": "passed",
-                "range": "40000-40002",
-                "mapped_entries": 6,
+                "range": "40000-40099",
+                "mapped_entries": 200,
                 "missing_mappings": [],
                 "failed": [],
             }),
@@ -271,8 +271,8 @@ class TestSelfTestMachinePortRange:
 
         assert exc_info.value.code == 0
         env = create_instance.call_args.kwargs["env"]
-        assert env["-p 40000-40002:40000-40002/tcp"] == "1"
-        assert env["-p 40000-40002:40000-40002/udp"] == "1"
+        assert env["-p 40000-40099:40000-40099/tcp"] == "1"
+        assert env["-p 40000-40099:40000-40099/udp"] == "1"
         assert env["VAST_SELF_TEST_PORT_START"] == "40000"
-        assert env["VAST_SELF_TEST_PORT_END"] == "40002"
+        assert env["VAST_SELF_TEST_PORT_END"] == "40099"
         assert "Port-range scan passed" in capsys.readouterr().out

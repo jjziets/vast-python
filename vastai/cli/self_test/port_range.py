@@ -18,7 +18,10 @@ from typing import Any
 HOST_PORT_RANGE_PATH = "/var/lib/vastai_kaalia/host_port_range"
 MIN_PORT = 1024
 MAX_PORT = 65535
-MAX_MAPPED_PORTS = 64
+# The self-test reserves these fixed mappings in addition to the configured
+# range. The host offer's direct_port_count is the source of truth for the
+# capacity check; it is not a fixed platform-wide limit.
+FIXED_PORT_MAPPING_COUNT = 4
 UDP_PROBE_RESPONSE_PREFIX = b"vast-self-test-udp-ok:"
 _PORT_RANGE_RE = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
 _PORT_KEY_RE = re.compile(r"^(\d+)/(tcp|udp)$", re.IGNORECASE)

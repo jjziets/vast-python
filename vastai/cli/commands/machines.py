@@ -25,7 +25,7 @@ from vastai.api import storage as storage_api
 from vastai.cli.utils import get_parser as _get_parser, get_client  # noqa: F401
 from vastai.cli.util import required_inet_mbps
 from vastai.cli.self_test.port_range import (
-    MAX_MAPPED_PORTS,
+    FIXED_PORT_MAPPING_COUNT,
     port_range_docker_args,
     resolve_port_range,
     scan_mapped_port_range,
@@ -591,35 +591,12 @@ def self_test__machine(args):
 
     configured_port_range, port_range_source = resolve_port_range()
     if configured_port_range is not None:
-        # The self-test instance also exposes the progress TCP port, the UDP
-        # responder, and usually SSH.  Vast currently limits an instance to
-        # 64 mapped port/protocol entries, so a complete TCP+UDP range can be
-        # handed to one instance only when it fits alongside those ports.
-        fixed_mapping_count = 4
-        range_mapping_count = configured_port_range.count * 2
-        if fixed_mapping_count + range_mapping_count <= MAX_MAPPED_PORTS:
-            result["port_scan"] = {
-                "status": "pending",
-                "range": configured_port_range.value,
-                "source": port_range_source,
-                "expected_ports": configured_port_range.count,
-            }
-        else:
-            result["port_scan"] = {
-                "status": "unsupported",
-                "range": configured_port_range.value,
-                "source": port_range_source,
-                "expected_ports": configured_port_range.count,
-                "reason": (
-                    f"Range contains {configured_port_range.count} ports, but a complete "
-                    "TCP+UDP scan needs two mappings per port and the platform limits "
-                    f"one instance to {MAX_MAPPED_PORTS} mapped entries."
-                ),
-            }
-            progress_print(
-                f"Port-range scan skipped for {configured_port_range.value}: "
-                f"the range is larger than the {MAX_MAPPED_PORTS}-mapping per-instance limit."
-            )
+        result["port_scan"] = {
+            "status": "pending",
+            "range": configured_port_range.value,
+            "source": port_range_source,
+            "expected_ports": configured_port_range.count,
+        }
     else:
         result["port_scan"] = {
             "status": "skipped",
@@ -809,6 +786,27 @@ def self_test__machine(args):
             result["reason"] = "No valid offers found."
         else:
             ask_contract_id = top_offer["id"]
+            if result.get("port_scan", {}).get("status") == "pending":
+                available_direct_ports = int(safe_float(top_offer.get("direct_port_count")))
+                required_direct_ports = (
+                    configured_port_range.count + FIXED_PORT_MAPPING_COUNT
+                )
+                result["port_scan"].update({
+                    "available_direct_ports": available_direct_ports,
+                    "required_direct_ports": required_direct_ports,
+                })
+                if available_direct_ports < required_direct_ports:
+                    result["port_scan"].update({
+                        "status": "unsupported",
+                        "reason": (
+                            f"Host advertises {available_direct_ports} direct ports, but "
+                            f"the self-test needs at least {required_direct_ports} for "
+                            f"the {configured_port_range.value} range and fixed mappings."
+                        ),
+                    })
+                    result["reason"] = result["port_scan"]["reason"]
+                    progress_print(f"Port-range self-test cannot continue: {result['reason']}")
+                    return result
             cuda_version = top_offer["cuda_max_good"]
             compute_cap = top_offer.get("compute_cap")
             docker_image, image_reason = cuda_map_to_image(cuda_version, compute_cap)
